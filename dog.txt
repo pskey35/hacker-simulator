@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ *  linux/kernel/acct.c
+ *
+ *  BSD Process Accounting for Linux
+ *
+ *  Author: Marco van Wieringen <mvw@planets.elm.net>
+ *
+ *  Some code based on ideas and code from:
+ *  Thomas K. Dyas <tdyas@eden.rutgers.edu>
+ *
+ *  This file implements BSD-style process accounting. Whenever any
+ *  process exits, an accounting record of type "struct acct" is
+ *  written to the file specified with the acct() system call. It is
+ *  up to user-level programs to do useful things with the accounting
+ *  log. The kernel just provides the raw accounting information.
+ *
+ * (C) Copyright 1995 - 1997 Marco van Wieringen - ELM Consultancy B.V.
+ *
+ *  Plugged two leaks. 1) It didn't return acct_file into the free_filps if
+ *  the file happened to be read-only. 2) If the accounting was suspended
+ *  due to the lack of space it happily allowed to reopen it and completely
+ *  lost the old acct_file. 3/10/98, Al Viro.
+ *
+ *  Now we silently close acct_file on attempt to reopen. Cleaned sys_acct().
+ *  XTerms and EMACS are manifestations of pure evil. 21/10/98, AV.
+ *
+ *  Fixed a nasty interaction with sys_umount(). If the accounting
+ *  was suspeneded we failed to stop it on umount(). Messy.
+ *  Another one: remount to readonly didn't stop accounting.
+ *	Question: what should we do if we have CAP_SYS_ADMIN but not
+ *  CAP_SYS_PACCT? Current code does the following: umount returns -EBUSY
+ *  unless we are messing with the root. In that case we are getting a
+ *  real mess with do_remount_sb(). 9/11/98, AV.
+ *
+ *  Fixed a bunch of races (and pair of leaks). Probably not the best way,
+ *  but this one obviously doesn't introduce deadlocks. Later. BTW, found
+ *  one race (and leak) in BSD implementation.
+ *  OK, that's better. ANOTHER race and leak in BSD variant. There always
+ *  is one more bug... 10/11/98, AV.
+ *
+ *	Oh, fsck... Oopsable SMP race in do_process_acct() - we must hold
+ * ->mmap_lock to walk the vma list of current->mm. Nasty, since it leaks
+ * a struct file opened for write. Fixed. 2/6/2000, AV.
+ */
+
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/acct.h>
+#include <linux/capability.h>
+#include <linux/file.h>
+#include <linux/tty.h>
+#include <linux/security.h>
+#include <linux/vfs.h>
+#include <linux/jiffies.h>
+#include <linux/times.h>
+#include <linux/syscalls.h>
+#include <linux/mount.h>
+#include <linux/uaccess.h>
+#include <linux/sched/cputime.h>
+
+#include <asm/div64.h>
+#include <linux/blkdev.h> /* sector_div */
+#include <linux/pid_namespace.h>
+#include <linux/fs_pin.h>
+
+/*
+ * These constants control the amount of freespace that suspend and
+ * resume the process accounting system, and the time delay between
+ * each check.
+ * Turned into sysctl-controllable parameters. AV, 12/11/98
+ */
+
+int acct_parm[3] = {4, 2, 30};
+#define RESUME		(acct_parm[0])	/* >foo% free space - resume */
+#define SUSPEND		(acct_parm[1])	/* <foo% free space - suspend */
+#define ACCT_TIMEOUT	(acct_parm[2])	/* foo second timeout between checks */
+
+/*
+ * External references and all of the globals.
+ */
+
+struct bsd_acct_struct {
+	struct fs_pin		pin;
+	atomic_long_t		count;
+	struct rcu_head		rcu;
+	struct mutex		lock;
+	int			active;
+	unsigned long		needcheck;
+	struct file		*file;
+	struct pid_namespace	*ns;
+	struct work_struct	work;
+	struct completion	done;
+};
+
+static void do_acct_process(struct bsd_acct_struct *acct);
+
+/*
+ * Check the amount of free space and suspend/resume accordingly.
+ */
+static int check_free_space(struct bsd_acct_struct *acct)
+{
+	struct kstatfs sbuf;
+
+	if (time_is_after_jiffies(acct->needcheck))
+		goto out;
+
+	/* May block */
+	if (vfs_statfs(&acct->file->f_path, &sbuf))
+		goto out;
+
+	if (acct->active) {
+		u64 suspend = sbuf.f_blocks * SUSPEND;
+		do_div(suspend, 100);
+		if (sbuf.f_bavail <= suspend) {
+			acct->active = 0;
+			pr_info("Process accounting paused\n");
+		}
+	} else {
+		u64 resume = sbuf.f_blocks * RESUME;
+		do_div(resume, 100);
+		if (sbuf.f_bavail >= resume) {
+			acct->active = 1;
+			pr_info("Process accounting resumed\n");
+		}
+	}
+
+	acct->needcheck = jiffies + ACCT_TIMEOUT*HZ;
+out:
+	return acct->active;
+}
+
+static void acct_put(struct bsd_acct_struct *p)
+{
+	if (atomic_long_dec_and_test(&p->count))
+		kfree_rcu(p, rcu);
+}
+
+static inline struct bsd_acct_struct *to_acct(struct fs_pin *p)
+{
+	return p ? container_of(p, struct bsd_acct_struct, pin) : NULL;
+}
+
+static struct bsd_acct_struct *acct_get(struct pid_namespace *ns)
+{
+	struct bsd_acct_struct *res;
+again:
+	smp_rmb();
+	rcu_read_lock();
+	res = to_acct(READ_ONCE(ns->bacct));
+	if (!res) {
+		rcu_read_unlock();
+		return NULL;
+	}
+	if (!atomic_long_inc_not_zero(&res->count)) {
+		rcu_read_unlock();
+		cpu_relax();
+		goto again;
+	}
+	rcu_read_unlock();
+	mutex_lock(&res->lock);
+	if (res != to_acct(READ_ONCE(ns->bacct))) {
+		mutex_unlock(&res->lock);
+		acct_put(res);
+		goto again;
+	}
+	return res;
+}
+
+THE END
